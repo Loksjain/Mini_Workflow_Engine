@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class WorkflowState(BaseModel):
@@ -16,9 +16,7 @@ class WorkflowState(BaseModel):
     errors: List[str] = Field(default_factory=list)
     meta: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        arbitrary_types_allowed = True
-        orm_mode = True
+    model_config = ConfigDict(arbitrary_types_allowed=True, from_attributes=True)
 
     def with_updates(
         self, data_updates: Dict[str, Any], error: Optional[str] = None
@@ -26,7 +24,7 @@ class WorkflowState(BaseModel):
         """Return a new WorkflowState with merged updates and optional error."""
         updated_data = {**self.data, **data_updates}
         updated_errors = self.errors + ([error] if error else [])
-        return self.copy(update={"data": updated_data, "errors": updated_errors})
+        return self.model_copy(update={"data": updated_data, "errors": updated_errors})
 
 
 def compute_state_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:

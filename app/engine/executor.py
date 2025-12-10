@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .graph import EdgeDefinition, Graph, graph_manager
 from .state import WorkflowState, compute_state_diff
@@ -25,8 +25,7 @@ class StepLog(BaseModel):
     state_diff: Dict[str, Any]
     duration_ms: float
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ExecutionEngine:
@@ -112,7 +111,7 @@ class ExecutionEngine:
 
             before_state = state
             before_snapshot = dict(state.data)
-            started_at = datetime.utcnow()
+            started_at = datetime.now(timezone.utc)
             try:
                 state = await self._execute_node(node_def, state)
                 success = True
@@ -123,7 +122,7 @@ class ExecutionEngine:
                 logger.exception("Node '%s' failed: %s", current_node, error)
                 state = before_state.with_updates({}, error=error)
 
-            duration_ms = (datetime.utcnow() - started_at).total_seconds() * 1000
+            duration_ms = (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
             state_diff = compute_state_diff(before_snapshot, state.data)
             self._append_log(
                 run_id=run_id,
@@ -224,7 +223,7 @@ class ExecutionEngine:
         state: WorkflowState,
     ) -> None:
         entry = StepLog(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             node=node,
             success=success,
             error=error,

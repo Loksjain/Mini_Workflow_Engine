@@ -13,18 +13,18 @@ from app.engine.state import WorkflowState
 
 
 @node_registry.register("test_increment")
-def test_increment(state: WorkflowState) -> WorkflowState:
+def node_test_increment(state: WorkflowState) -> WorkflowState:
     value = state.data.get("value", 0) + 1
     return state.with_updates({"value": value})
 
 
 @node_registry.register("test_double")
-def test_double(state: WorkflowState) -> WorkflowState:
+def node_test_double(state: WorkflowState) -> WorkflowState:
     return state.with_updates({"value": state.data.get("value", 1) * 2})
 
 
 @node_registry.register("test_fail")
-def test_fail(state: WorkflowState) -> WorkflowState:
+def node_test_fail(state: WorkflowState) -> WorkflowState:
     raise RuntimeError("intentional failure")
 
 
