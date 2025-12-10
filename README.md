@@ -27,6 +27,9 @@ app/
   api/
     routes.py
   main.py
+tests/
+  test_api.py
+  test_engine.py
 README.md
 ```
 
@@ -43,6 +46,11 @@ uvicorn app.main:app --reload
 ```
 
 3) Open docs at `http://localhost:8000/docs`.
+
+4) Run tests:
+```bash
+pytest
+```
 
 ### Stream Logs Over WebSocket
 ```
