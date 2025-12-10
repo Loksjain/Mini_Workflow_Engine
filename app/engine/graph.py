@@ -3,12 +3,13 @@ from __future__ import annotations
 """Graph definitions and manager."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Union
 from uuid import uuid4
 
 from .node import NodeDefinition
 from .registry import node_registry
+from .persistence import persistence
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,18 @@ class Graph:
     start_node: str
     description: Optional[str] = None
 
+    def to_record(self) -> Dict[str, Union[str, List[str], Dict[str, List[Dict[str, Optional[str]]]]]]:
+        """Serialize graph definition for persistence or APIs."""
+        return {
+            "id": self.id,
+            "description": self.description,
+            "start_node": self.start_node,
+            "nodes": list(self.nodes.keys()),
+            "edges": {
+                origin: [asdict(edge) for edge in edges] for origin, edges in self.edges.items()
+            },
+        }
+
 
 class GraphManager:
     """In-memory registry for graphs."""
@@ -38,6 +51,11 @@ class GraphManager:
     def register_graph(self, graph: Graph) -> Graph:
         self._graphs[graph.id] = graph
         logger.info("Registered graph '%s' with %d nodes", graph.id, len(graph.nodes))
+        if persistence:
+            try:
+                persistence.save_graph(graph.to_record())
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to persist graph '%s': %s", graph.id, exc)
         return graph
 
     def create_graph(
@@ -69,6 +87,15 @@ class GraphManager:
 
     def all_graphs(self) -> Dict[str, Graph]:
         return dict(self._graphs)
+
+    def list_graph_records(self) -> List[Dict[str, Union[str, List[str], Dict[str, List[Dict[str, Optional[str]]]]]]]:
+        """Return persisted graph definitions if available, otherwise in-memory."""
+        if persistence:
+            try:
+                return persistence.list_graphs()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to list persisted graphs: %s", exc)
+        return [graph.to_record() for graph in self._graphs.values()]
 
     @staticmethod
     def _normalize_edges(

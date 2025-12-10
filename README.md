@@ -1,68 +1,184 @@
-# Mini Workflow Engine (LangGraph Style)
+Mini Workflow Engine (LangGraph Style)
 
-A complete FastAPI project that implements a minimal workflow/graph engine with shared state, nodes, edges, conditional branching, looping, tool registry, execution logs, and an end-to-end code-review example workflow.
+A complete FastAPI project that implements a minimal workflow/graph engine with shared state, nodes, edges, conditional branching, looping, tool registry, execution logs, and an end-to-end code-review example workflow — now enhanced with background execution, optional SQLite persistence, and safe condition parsing.
 
-## Features
+Features
+🧠 Workflow / Graph Engine
 
-- Graph execution with nodes as Python functions, automatic node registration, shared state propagation, edges for linear/branching/loop flows, and terminal node detection.
-- Conditional routing and loop support via edge conditions evaluated against the live state.
-- Tool registry for reusable callables; nodes can invoke tools directly.
-- Execution engine with run_id/graph_id auto-generation, node-level try/except isolation, optional async nodes, optional per-node timeouts, and per-step state diffs.
-- Detailed execution log entries with timestamps, durations, node names, success flags, errors, and state diffs; state/error tracking stored in-memory.
-- FastAPI endpoints: `POST /graph/create`, `POST /graph/run`, `GET /graph/state/{run_id}`, WebSocket `ws://.../graph/stream/{run_id}`, plus `GET /health`.
-- Example code-review workflow (extract -> complexity -> issues -> suggestions -> quality gate loop -> finalize) showing tools, conditionals, and loops.
+Nodes as Python functions with automatic registration.
 
-## Project Structure
+Shared state propagation between nodes.
 
-```
+Edge-based flow control: linear, branching, conditional, loops.
+
+Terminal node detection when no outgoing edges.
+
+🔀 Conditional Routing & Loop Support
+
+Conditions evaluated against live state.
+
+Safe AST parsing (no raw eval) prevents unsafe expressions.
+
+Looping via back-edges (e.g., quality_gate → detect_basic_issues).
+
+🛠 Tool Registry
+
+Reusable Python callables registered as tools.
+
+Nodes invoke tools directly through the registry.
+
+⚙ Execution Engine
+
+Auto-generated run_id and graph_id.
+
+Node-level try/except isolation.
+
+Optional async node support.
+
+Optional per-node timeouts.
+
+Per-step state diffs to track incremental state changes.
+
+📜 Detailed Execution Logs
+
+Timestamp per node execution.
+
+Duration in milliseconds.
+
+Node name, success flag, failure reason.
+
+Incremental state diffs.
+
+Stored in memory — and optionally persisted to SQLite.
+
+🛰 FastAPI Endpoints
+
+POST /graph/create — create/define a workflow graph
+
+POST /graph/run — start a workflow run (now runs in background)
+
+GET /graph/state/{run_id} — inspect state + logs
+
+GET /graphs — list graphs (new)
+
+GET /graphs/{graph_id} — graph detail (new)
+
+GET /runs — list workflow runs (new)
+
+GET /runs/{run_id} — run detail (new)
+
+WS /graph/stream/{run_id} — live log streaming
+
+GET /health — health check
+
+🧪 Example Workflow: Code Review Agent
+
+Extract → analyze → detect issues → suggest → loop until quality threshold → finalize.
+
+✨ Newly Added Enhancements (Major Improvements)
+
+These are the new features you added — clearly separated:
+
+🚀 1. Background Execution
+
+POST /graph/run now:
+
+Starts the workflow in a background asyncio task
+
+Returns immediately with { run_id, status: "running" }
+
+Allows real-time progress updates via API or WebSocket
+
+🗄 2. SQLite Persistence (Optional)
+
+Stored in app/workflow.db:
+
+Graph definitions
+
+Workflow runs
+
+Per-step execution logs
+
+Run timestamps and metadata
+
+Engine automatically falls back to in-memory if DB unavailable.
+
+🔒 3. Safer Condition Evaluation
+
+Replaces eval() with a mini DSL using AST whitelisting
+
+Only safe constructs allowed (Compare, BoolOp, Name, Subscript, Call(get), etc.)
+
+Invalid conditions → treated as False instead of breaking
+
+📊 4. Richer Run Metadata
+
+Enum-based RunStatus (running, completed, failed, timeout)
+
+error_type field in step logs
+
+Start and finish timestamps for every run
+
+Per-node timing & structured diffs
+
+Project Structure
 app/
   engine/
-    graph.py
-    node.py
-    state.py
-    executor.py
-    registry.py
+    graph.py         # Graph structure & edge definitions
+    node.py          # Node definition helper
+    state.py         # WorkflowState & diff utilities
+    executor.py      # Background runner, logs, statuses
+    registry.py      # Registries for nodes/tools
+    persistence.py   # SQLite adapter (optional)
   workflows/
-    codereview.py
+    codereview.py    # Code review example workflow
   api/
-    routes.py
-  main.py
+    routes.py        # REST + WebSocket endpoints
+  main.py            # FastAPI bootstrap
 tests/
   test_api.py
   test_engine.py
 README.md
-```
 
-## How to Run
+How to Run
+Install dependencies:
+pip install -r requirements.txt
 
-1) Install dependencies:
-```bash
-pip install fastapi uvicorn pydantic
-```
-
-2) Start the API:
-```bash
+Start the API:
 uvicorn app.main:app --reload
-```
 
-3) Open docs at `http://localhost:8000/docs`.
 
-4) Run tests:
-```bash
+Open Swagger Docs:
+👉 http://localhost:8000/docs
+
+Run tests:
 pytest
-```
 
-### Stream Logs Over WebSocket
-```
+
+SQLite DB is created automatically at app/workflow.db.
+Delete it any time for a clean slate.
+
+Stream Logs Over WebSocket
 ws://localhost:8000/graph/stream/<run_id>
-```
-Connect after starting a run to receive log events (`type=log`) and status updates (`type=status`) as they are produced.
 
-## Example Workflow (Code Review Agent)
 
-1) The workflow registers automatically on startup with id `code_review_agent`.
-2) Execute it:
-```bash
+You will receive:
+
+{"type": "log", ...} — step-by-step logs
+
+{"type": "status", ...} — status transitions
+
+Live incremental state updates
+
+Example Workflow (Code Review Agent)
+
+The workflow auto-registers on startup with:
+
+graph_id = "code_review_agent"
+
+
+Execute it:
+
 curl -X POST http://localhost:8000/graph/run \
   -H "Content-Type: application/json" \
   -d '{
@@ -73,18 +189,30 @@ curl -X POST http://localhost:8000/graph/run \
           "max_iterations": 3
         }
       }'
-```
-3) Response returns `run_id`, `final_state`, `execution_log`, and `status`. The log includes timestamps, state diffs per node, and any errors.
 
-## Engine Behavior
 
-- Nodes receive and return `WorkflowState`; updates are merged into `state.data`.
-- Edges are evaluated in order. The first condition that evaluates to true is taken; otherwise the last unconditional edge is used. Missing edges end execution.
-- Loops are achieved by pointing an edge back to an earlier node. `quality_gate` in the example loops until the score crosses the threshold or max iterations are reached.
-- Timeouts per node are supported via the `timeout_seconds` decorator argument.
+Response includes:
 
-## What Can Be Improved
+run_id
 
-- Persist graphs, runs, and logs to a database (SQLite/Postgres) instead of in-memory stores.
-- Harden condition evaluation with a DSL instead of `eval`.
-- Provide OpenAPI schemas for dynamic tool registration and graph listing.
+current status
+
+final_state (if completed)
+
+complete execution log
+
+Engine Behavior
+
+Nodes return either a dict or WorkflowState.
+
+State updates merge into state.data.
+
+Edges evaluated top-to-bottom; first passing condition wins.
+
+Last unconditional edge is fallback.
+
+No outgoing edges = end of workflow.
+
+Loops occur naturally via back-edges.
+
+Timeout support via timeout_seconds decorator.

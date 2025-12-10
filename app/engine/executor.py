@@ -2,9 +2,11 @@ from __future__ import annotations
 
 """Workflow execution engine with logging, diffs, and error isolation."""
 
+import ast
 import asyncio
 import logging
 from datetime import datetime, timezone
+from enum import Enum
 from threading import Lock
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -12,6 +14,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from .graph import EdgeDefinition, Graph, graph_manager
+from .persistence import persistence
 from .state import WorkflowState, compute_state_diff
 
 logger = logging.getLogger(__name__)
@@ -22,10 +25,22 @@ class StepLog(BaseModel):
     node: str
     success: bool
     error: Optional[str] = None
+    error_type: Optional[str] = None
     state_diff: Dict[str, Any]
     duration_ms: float
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class RunStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    FAILED_MISSING_NODE = "failed_missing_node"
+    HALTED_MAX_STEPS = "halted_max_steps"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
 
 
 class ExecutionEngine:
@@ -35,7 +50,10 @@ class ExecutionEngine:
         self.max_steps = max_steps
         self._run_states: Dict[str, WorkflowState] = {}
         self._run_logs: Dict[str, List[StepLog]] = {}
-        self._run_status: Dict[str, str] = {}
+        self._run_status: Dict[str, RunStatus] = {}
+        self._run_errors: Dict[str, Optional[str]] = {}
+        self._run_started_at: Dict[str, datetime] = {}
+        self._run_finished_at: Dict[str, Optional[datetime]] = {}
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
         self._run_tasks: Dict[str, asyncio.Task] = {}
         self._lock = Lock()
@@ -45,12 +63,27 @@ class ExecutionEngine:
     ) -> tuple[Graph, WorkflowState, str]:
         graph = graph_manager.get_graph(graph_id)
         rid = run_id or str(uuid4())
+        now = datetime.now(timezone.utc)
         state = WorkflowState(run_id=rid, graph_id=graph_id, data=initial_state or {})
         with self._lock:
             self._run_states[rid] = state
             self._run_logs[rid] = []
-            self._run_status[rid] = "running"
+            self._run_status[rid] = RunStatus.RUNNING
+            self._run_errors[rid] = None
+            self._run_started_at[rid] = now
+            self._run_finished_at[rid] = None
             self._subscribers.setdefault(rid, [])
+        if persistence:
+            try:
+                persistence.record_run_start(
+                    run_id=rid,
+                    graph_id=graph_id,
+                    started_at=now,
+                    initial_state=state.data,
+                    status=RunStatus.RUNNING.value,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to persist run start '%s': %s", rid, exc)
         return graph, state, rid
 
     async def run_graph(
@@ -59,11 +92,13 @@ class ExecutionEngine:
         """Execute a registered graph from its start node."""
         graph, state, rid = self._prepare_run(graph_id, initial_state, run_id)
         await self._execute(graph, state, rid)
+        status_value = self._run_status.get(rid, RunStatus.UNKNOWN)
+        status_str = status_value.value if isinstance(status_value, Enum) else str(status_value)
         return {
             "run_id": rid,
             "state": self._run_states.get(rid, state),
             "log": self._run_logs.get(rid, []),
-            "status": self._run_status.get(rid, "unknown"),
+            "status": status_str,
         }
 
     def start_run_background(
@@ -88,7 +123,9 @@ class ExecutionEngine:
 
         while current_node:
             if steps >= self.max_steps:
-                self._run_status[run_id] = "halted_max_steps"
+                self._update_status(
+                    run_id, RunStatus.HALTED_MAX_STEPS, state, error="Max steps exceeded"
+                )
                 logger.warning(
                     "Run %s halted after reaching max steps (%s)", run_id, self.max_steps
                 )
@@ -96,16 +133,19 @@ class ExecutionEngine:
 
             node_def = graph.nodes.get(current_node)
             if node_def is None:
-                self._run_status[run_id] = "failed_missing_node"
                 error_msg = f"Node '{current_node}' not found in graph"
                 self._append_log(
                     run_id=run_id,
                     node=current_node,
                     success=False,
                     error=error_msg,
+                    error_type="MissingNode",
                     state_diff={},
                     duration_ms=0.0,
                     state=state,
+                )
+                self._update_status(
+                    run_id, RunStatus.FAILED_MISSING_NODE, state, error=error_msg
                 )
                 break
 
@@ -116,11 +156,13 @@ class ExecutionEngine:
                 state = await self._execute_node(node_def, state)
                 success = True
                 error = None
+                error_type = None
             except Exception as exc:
                 success = False
                 error = str(exc)
                 logger.exception("Node '%s' failed: %s", current_node, error)
                 state = before_state.with_updates({}, error=error)
+                error_type = exc.__class__.__name__
 
             duration_ms = (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
             state_diff = compute_state_diff(before_snapshot, state.data)
@@ -129,18 +171,19 @@ class ExecutionEngine:
                 node=current_node,
                 success=success,
                 error=error,
+                error_type=error_type,
                 state_diff=state_diff,
                 duration_ms=duration_ms,
                 state=state,
             )
 
             if not success:
-                self._run_status[run_id] = "failed"
+                self._update_status(run_id, RunStatus.FAILED, state, error=error)
                 break
 
             next_node = self._determine_next_node(graph, current_node, state)
             if not next_node:
-                self._run_status[run_id] = "completed"
+                self._update_status(run_id, RunStatus.COMPLETED, state)
                 break
 
             current_node = next_node
@@ -149,11 +192,13 @@ class ExecutionEngine:
         with self._lock:
             self._run_states[run_id] = state
         # Broadcast terminal status to subscribers.
+        status_value = self._run_status.get(run_id, RunStatus.UNKNOWN)
+        status_str = status_value.value if isinstance(status_value, Enum) else str(status_value)
         self._broadcast(
             run_id,
             {
                 "type": "status",
-                "data": self._run_status.get(run_id, "unknown"),
+                "data": status_str,
                 "state": state.data,
             },
         )
@@ -194,23 +239,99 @@ class ExecutionEngine:
         return fallback
 
     def _evaluate_condition(self, expression: str, state: WorkflowState) -> bool:
-        """Evaluate a simple condition string against the current state.
+        """Safely evaluate a condition against the current state using a minimal AST whitelist."""
 
-        Guard against dangerous patterns by disallowing dunder access and limiting
-        globals. This stays intentionally constrained while still using eval.
-        """
-        if "__" in expression:
-            logger.warning("Rejected condition with dunder access: %s", expression)
-            return False
-        safe_globals = {
-            "__builtins__": {"len": len, "min": min, "max": max, "sum": sum}
-        }
-        safe_locals = {"state": state}
+        allowed_names = {"state", "data"}
+        allowed_calls = {"get", "len", "min", "max", "sum"}
+
         try:
-            return bool(eval(expression, safe_globals, safe_locals))
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:
+            logger.warning("Rejected condition '%s': %s", expression, exc)
+            return False
+
+        def _validate(node: ast.AST) -> bool:
+            if isinstance(node, ast.Expression):
+                return _validate(node.body)
+            if isinstance(node, ast.BoolOp):
+                return all(_validate(value) for value in node.values)
+            if isinstance(node, ast.UnaryOp):
+                return isinstance(node.op, (ast.Not,)) and _validate(node.operand)
+            if isinstance(node, ast.Compare):
+                return _validate(node.left) and all(_validate(comparator) for comparator in node.comparators)
+            if isinstance(node, ast.BinOp):
+                return isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)) and _validate(node.left) and _validate(
+                    node.right
+                )
+            if isinstance(node, ast.Name):
+                return node.id in allowed_names and "__" not in node.id
+            if isinstance(node, ast.Constant):
+                return True
+            if isinstance(node, ast.Attribute):
+                if node.attr.startswith("__"):
+                    return False
+                return _validate(node.value)
+            if isinstance(node, ast.Subscript):
+                return _validate(node.value) and _validate(node.slice)
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute):
+                    if node.func.attr not in allowed_calls or node.func.attr.startswith("__"):
+                        return False
+                elif isinstance(node.func, ast.Name):
+                    if node.func.id not in allowed_calls:
+                        return False
+                else:
+                    return False
+                return all(_validate(arg) for arg in node.args) and all(_validate(kw.value) for kw in node.keywords)
+            return False
+
+        if not _validate(tree):
+            logger.warning("Rejected unsafe condition: %s", expression)
+            return False
+
+        safe_globals: Dict[str, Any] = {"__builtins__": {}}
+        safe_locals: Dict[str, Any] = {"state": state, "data": state.data, "len": len, "min": min, "max": max, "sum": sum}
+        try:
+            return bool(eval(compile(tree, "<condition>", "eval"), safe_globals, safe_locals))
         except Exception as exc:
             logger.warning("Failed to evaluate condition '%s': %s", expression, exc)
             return False
+
+    def _update_status(
+        self,
+        run_id: str,
+        status: RunStatus,
+        state: WorkflowState,
+        error: Optional[str] = None,
+    ) -> None:
+        finished_at: Optional[datetime] = None
+        if status in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.FAILED_MISSING_NODE,
+            RunStatus.HALTED_MAX_STEPS,
+            RunStatus.TIMEOUT,
+        ):
+            finished_at = datetime.now(timezone.utc)
+
+        with self._lock:
+            self._run_status[run_id] = status
+            self._run_states[run_id] = state
+            self._run_finished_at[run_id] = finished_at
+            if error:
+                self._run_errors[run_id] = error
+
+        if persistence and finished_at:
+            try:
+                persistence.record_run_finish(
+                    run_id=run_id,
+                    status=status.value,
+                    finished_at=finished_at,
+                    final_state=state.data,
+                    last_error=error,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to persist run '%s' completion: %s", run_id, exc)
 
     def _append_log(
         self,
@@ -218,6 +339,7 @@ class ExecutionEngine:
         node: str,
         success: bool,
         error: Optional[str],
+        error_type: Optional[str],
         state_diff: Dict[str, Any],
         duration_ms: float,
         state: WorkflowState,
@@ -227,12 +349,29 @@ class ExecutionEngine:
             node=node,
             success=success,
             error=error,
+            error_type=error_type,
             state_diff=state_diff,
             duration_ms=duration_ms,
         )
         with self._lock:
             self._run_logs.setdefault(run_id, []).append(entry)
             self._run_states[run_id] = state
+            step_no = len(self._run_logs[run_id])
+        if persistence:
+            try:
+                persistence.append_step(
+                    run_id=run_id,
+                    step_no=step_no,
+                    node=node,
+                    timestamp=entry.timestamp,
+                    success=success,
+                    error=error,
+                    error_type=error_type,
+                    state_diff=state_diff,
+                    duration_ms=duration_ms,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to persist step for run '%s': %s", run_id, exc)
         self._broadcast(run_id, {"type": "log", "data": entry.model_dump()})
 
     def get_state(self, run_id: str) -> WorkflowState:
@@ -241,13 +380,44 @@ class ExecutionEngine:
                 raise KeyError(f"Run '{run_id}' not found")
             return self._run_states[run_id]
 
+    def get_timestamps(self, run_id: str) -> tuple[Optional[datetime], Optional[datetime]]:
+        with self._lock:
+            if run_id not in self._run_states:
+                raise KeyError(f"Run '{run_id}' not found")
+            return self._run_started_at.get(run_id), self._run_finished_at.get(run_id)
+
     def get_log(self, run_id: str) -> List[StepLog]:
         with self._lock:
             return list(self._run_logs.get(run_id, []))
 
-    def get_status(self, run_id: str) -> str:
+    def get_status(self, run_id: str) -> RunStatus:
         with self._lock:
-            return self._run_status.get(run_id, "unknown")
+            return self._run_status.get(run_id, RunStatus.UNKNOWN)
+
+    def get_run_error(self, run_id: str) -> Optional[str]:
+        with self._lock:
+            return self._run_errors.get(run_id)
+
+    def list_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        if persistence:
+            try:
+                return persistence.list_runs(limit=limit)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to list persisted runs: %s", exc)
+        with self._lock:
+            result: List[Dict[str, Any]] = []
+            for run_id, status in list(self._run_status.items())[:limit]:
+                result.append(
+                    {
+                        "run_id": run_id,
+                        "graph_id": self._run_states.get(run_id, WorkflowState()).graph_id,
+                        "status": status.value if isinstance(status, Enum) else status,
+                        "started_at": self._run_started_at.get(run_id),
+                        "finished_at": self._run_finished_at.get(run_id),
+                        "last_error": self._run_errors.get(run_id),
+                    }
+                )
+            return result
 
     def subscribe(self, run_id: str) -> asyncio.Queue:
         """Subscribe to log events for a given run."""
